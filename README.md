@@ -99,3 +99,4 @@ $0/month. Cloudflare Workers free tier covers 100,000 requests per day. Interval
 ## License
 
 MIT
+
