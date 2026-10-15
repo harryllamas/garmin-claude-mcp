@@ -184,6 +184,39 @@ export class MyMCP extends McpAgent {
         };
       },
     );
+
+    this.server.tool(
+      "getPoolTimetable",
+      "Leys Pools (Oxford) lane-swimming slots for the days ahead, from the More Leisure timetable page " +
+        "(~31 days published). Use when planning swims.",
+      {
+        days: z.number().min(1).max(31).optional().describe("Days ahead, default 14"),
+        activity: z.string().optional().describe('Session name filter, default "Lane Swimming"'),
+      },
+      async ({ days = 14, activity = "Lane Swimming" }) => {
+        try {
+          const data = await poolTimetable(days, activity);
+          return { content: [{ type: "text", text: JSON.stringify(data) }] };
+        } catch (e) {
+          return { content: [{ type: "text", text: `getPoolTimetable failed: ${String(e)}` }], isError: true };
+        }
+      },
+    );
+
+    this.server.tool(
+      "getWeather",
+      "Daily weather forecast for the Oxford–Harwell commute (Open-Meteo): rain, snow, wind, temps, " +
+        "sunrise/sunset, plus 06:00, 08:00 and 18:00 snapshots. Use when deciding commute rides vs KICKR.",
+      { days: z.number().min(1).max(16).optional().describe("Days ahead, default 7") },
+      async ({ days = 7 }) => {
+        try {
+          const data = await weatherForecast(days);
+          return { content: [{ type: "text", text: JSON.stringify(data) }] };
+        } catch (e) {
+          return { content: [{ type: "text", text: `getWeather failed: ${String(e)}` }], isError: true };
+        }
+      },
+    );
   }
 }
 
@@ -427,4 +460,132 @@ function calExpand(e: any, from: number, to: number): number[] {
     }
   }
   return out;
+}
+
+// ---------------------------------------------------------------------
+// Pool timetable helpers (used by getPoolTimetable)
+// The More Leisure page embeds ~31 days of sessions as JSON in a `data-days`
+// attribute on <div data-timetable-component-mount data-title="Swim timetable">.
+// ---------------------------------------------------------------------
+const LEYS_URL = "https://www.moreleisure.com/leys-pools-leisure-centre/timetables/";
+
+function htmlDecode(s: string) {
+  return s
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&#x27;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
+}
+
+// "6:30 AM" -> "06:30"
+function to24h(t: string) {
+  const m = String(t).trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  if (!m) return t;
+  let h = parseInt(m[1], 10) % 12;
+  if (m[3].toUpperCase() === "PM") h += 12;
+  return `${String(h).padStart(2, "0")}:${m[2]}`;
+}
+
+async function poolTimetable(days: number, activity: string) {
+  const res = await fetch(LEYS_URL, {
+    headers: { "User-Agent": "Mozilla/5.0 (compatible; harry-training-planner)" },
+  });
+  if (!res.ok) throw new Error(`moreleisure.com returned HTTP ${res.status}`);
+
+  // HTMLRewriter streams the ~1 MB page rather than holding it all as a string.
+  const mounts: { title: string; days: string }[] = [];
+  await new HTMLRewriter()
+    .on("div[data-timetable-component-mount]", {
+      element(el) {
+        mounts.push({
+          title: el.getAttribute("data-title") ?? "",
+          days: el.getAttribute("data-days") ?? "[]",
+        });
+      },
+    })
+    .transform(res)
+    .arrayBuffer();
+
+  const swim = mounts.find((m) => /swim timetable/i.test(m.title));
+  if (!swim) throw new Error("Swim timetable block not found on page (layout changed?)");
+
+  const raw = swim.days.includes("&quot;") ? htmlDecode(swim.days) : swim.days;
+  const parsed: { date: string; classes: any[] }[] = JSON.parse(raw);
+  const from = calTodayStart();
+  const today = calFmt(from, true);
+  const end = calFmt(from + days * CAL_DAY, true);
+  const want = activity.toLowerCase();
+
+  return {
+    pool: "Leys Pools & Leisure Centre",
+    activity,
+    window: `${today} to ${end}`,
+    days: parsed
+      .filter((d) => d.date >= today && d.date <= end)
+      .map((d) => ({
+        date: d.date,
+        weekday: new Date(`${d.date}T12:00:00Z`).toLocaleDateString("en-GB", { weekday: "short", timeZone: "UTC" }),
+        slots: (d.classes ?? [])
+          .filter((c) => String(c.name ?? "").toLowerCase().includes(want))
+          .map((c) => ({ start: to24h(c.timeStart), end: to24h(c.timeEnd), spaces: c.spaces })),
+      })),
+  };
+}
+
+// ---------------------------------------------------------------------
+// Weather helpers (used by getWeather) — Open-Meteo, free, no key.
+// Centred on Abingdon, midpoint of the Oxford–Harwell commute.
+// ---------------------------------------------------------------------
+const WX_LAT = 51.67, WX_LON = -1.28;
+
+async function weatherForecast(days: number) {
+  const url =
+    `https://api.open-meteo.com/v1/forecast?latitude=${WX_LAT}&longitude=${WX_LON}` +
+    `&timezone=Europe%2FLondon&forecast_days=${Math.min(days, 16)}&wind_speed_unit=kmh` +
+    `&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,` +
+    `precipitation_probability_max,snowfall_sum,wind_speed_10m_max,wind_gusts_10m_max,sunrise,sunset` +
+    `&hourly=temperature_2m,apparent_temperature,precipitation,precipitation_probability,` +
+    `snowfall,wind_speed_10m,wind_gusts_10m,wind_direction_10m`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`Open-Meteo returned HTTP ${r.status}`);
+  const w: any = await r.json();
+  const h = w.hourly;
+
+  const at = (date: string, hh: string) => {
+    const i = h.time.indexOf(`${date}T${hh}:00`);
+    if (i < 0) return null;
+    return {
+      temp: h.temperature_2m[i],
+      feels: h.apparent_temperature[i],
+      rain_mm: h.precipitation[i],
+      rain_pct: h.precipitation_probability[i],
+      snow_cm: h.snowfall[i],
+      wind: h.wind_speed_10m[i],
+      gusts: h.wind_gusts_10m[i],
+      wind_dir: h.wind_direction_10m[i],
+    };
+  };
+
+  const d = w.daily;
+  return {
+    location: "Abingdon (Oxford–Harwell commute midpoint)",
+    units: "°C, mm, cm, km/h; weather_code is WMO",
+    days: d.time.map((date: string, i: number) => ({
+      date,
+      code: d.weather_code[i],
+      tmin: d.temperature_2m_min[i],
+      tmax: d.temperature_2m_max[i],
+      rain_mm: d.precipitation_sum[i],
+      rain_pct: d.precipitation_probability_max[i],
+      snow_cm: d.snowfall_sum[i],
+      wind_max: d.wind_speed_10m_max[i],
+      gust_max: d.wind_gusts_10m_max[i],
+      sunrise: String(d.sunrise[i]).slice(11),
+      sunset: String(d.sunset[i]).slice(11),
+      at_0600: at(date, "06"),
+      commute_am_0800: at(date, "08"),
+      commute_pm_1800: at(date, "18"),
+    })),
+  };
 }
